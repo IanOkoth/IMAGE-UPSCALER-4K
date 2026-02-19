@@ -1,20 +1,112 @@
 import { NextRequest, NextResponse } from "next/server";
-import { HfInference } from "@huggingface/inference";
+import { Client } from "@gradio/client";
 
 export const maxDuration = 60;
 
-// Models to try in order — the first one to return a result wins
-// Using only swin2SR models which are confirmed to be on HF Inference API
-const MODELS_BY_SCALE: Record<string, string[]> = {
-    "2x": [
+// HuggingFace Spaces running Real-ESRGAN — tried in order
+const SPACES = [
+    "bookbot/image-upscaling-playground",
+    "Nick088/RealESRGAN-Pytorch",
+    "not-lain/Super-Resolution",
+] as const;
+
+async function trySpace(
+    spaceId: string,
+    imageBlob: Blob,
+    scale: number,
+    hfToken?: string
+): Promise<{ success: boolean; data?: string; error?: string }> {
+    try {
+        console.log(`Trying Space: ${spaceId}`);
+
+        const client = await Client.connect(spaceId, {
+            token: (hfToken as `hf_${string}`) || undefined,
+        });
+
+        // Most Real-ESRGAN Spaces use /predict as the API endpoint
+        // with (image, scale) as inputs
+        const result = await client.predict("/predict", {
+            img: imageBlob,
+            scale: scale,
+        });
+
+        const data = result.data as Array<{ url?: string; path?: string }>;
+
+        if (data && data.length > 0) {
+            const outputFile = data[0];
+            const imageUrl = outputFile?.url || outputFile?.path;
+
+            if (imageUrl) {
+                // For Gradio Spaces, the URL is temporary — we need to fetch and convert to base64
+                const imageResponse = await fetch(imageUrl);
+                if (imageResponse.ok) {
+                    const buffer = Buffer.from(await imageResponse.arrayBuffer());
+                    const base64 = buffer.toString("base64");
+                    const contentType =
+                        imageResponse.headers.get("content-type") || "image/png";
+                    return {
+                        success: true,
+                        data: `data:${contentType};base64,${base64}`,
+                    };
+                }
+            }
+        }
+
+        return { success: false, error: "No output from Space" };
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(`Space ${spaceId} failed: ${msg}`);
+        return { success: false, error: msg };
+    }
+}
+
+// Fallback: call HuggingFace Inference API directly for any available model
+async function tryHfInference(
+    imageBuffer: Buffer,
+    hfToken: string
+): Promise<{ success: boolean; data?: string; error?: string }> {
+    const models = [
+        "caidas/swin2SR-classical-sr-x2-64",
         "caidas/swin2SR-lightweight-x2-64",
-        "caidas/swin2SR-classical-sr-x2-64",
-    ],
-    "4x": [
-        "caidas/swin2SR-lightweight-x2-64", // fallback: 2x if 4x unavailable
-        "caidas/swin2SR-classical-sr-x2-64",
-    ],
-};
+    ];
+
+    for (const model of models) {
+        try {
+            console.log(`Trying HF Inference: ${model}`);
+            const response = await fetch(
+                `https://api-inference.huggingface.co/models/${model}`,
+                {
+                    method: "POST",
+                    headers: {
+                        Authorization: `Bearer ${hfToken}`,
+                        "Content-Type": "application/octet-stream",
+                    },
+                    body: new Uint8Array(imageBuffer),
+                }
+            );
+
+            if (response.ok) {
+                const buffer = Buffer.from(await response.arrayBuffer());
+                const contentType =
+                    response.headers.get("content-type") || "image/png";
+                const base64 = buffer.toString("base64");
+                return {
+                    success: true,
+                    data: `data:${contentType};base64,${base64}`,
+                };
+            }
+
+            const errorBody = await response.text();
+            console.log(`HF model ${model} returned ${response.status}: ${errorBody}`);
+        } catch (err) {
+            console.log(
+                `HF model ${model} error: ${err instanceof Error ? err.message : err}`
+            );
+        }
+    }
+
+    return { success: false, error: "All HF Inference models unavailable" };
+}
 
 export async function POST(request: NextRequest) {
     try {
@@ -24,7 +116,7 @@ export async function POST(request: NextRequest) {
             return NextResponse.json(
                 {
                     error:
-                        "Hugging Face API token is not configured. Please set HUGGINGFACE_API_TOKEN in your environment variables.",
+                        "Hugging Face API token is not configured. Set HUGGINGFACE_API_TOKEN in your environment variables.",
                 },
                 { status: 500 }
             );
@@ -32,7 +124,8 @@ export async function POST(request: NextRequest) {
 
         const formData = await request.formData();
         const file = formData.get("image") as File | null;
-        const scale = (formData.get("scale") as string) || "4x";
+        const scaleParam = (formData.get("scale") as string) || "4x";
+        const scale = parseInt(scaleParam.replace("x", ""), 10) || 4;
 
         if (!file) {
             return NextResponse.json(
@@ -45,83 +138,57 @@ export async function POST(request: NextRequest) {
         const validTypes = ["image/jpeg", "image/png", "image/webp", "image/jpg"];
         if (!validTypes.includes(file.type)) {
             return NextResponse.json(
-                {
-                    error:
-                        "Invalid file type. Please upload a JPEG, PNG, or WebP image.",
-                },
+                { error: "Invalid file type. Upload a JPEG, PNG, or WebP image." },
                 { status: 400 }
             );
         }
 
-        // Validate file size (5MB for better HF API compatibility)
+        // Validate file size (5MB)
         const MAX_SIZE = 5 * 1024 * 1024;
         if (file.size > MAX_SIZE) {
             return NextResponse.json(
                 {
-                    error: `File size (${(file.size / (1024 * 1024)).toFixed(1)}MB) exceeds the 5MB limit for upscaling.`,
+                    error: `File too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). Max 5MB.`,
                 },
                 { status: 400 }
             );
         }
 
-        const hf = new HfInference(token);
-        const imageBlob = new Blob([await file.arrayBuffer()], { type: file.type });
-        const models = MODELS_BY_SCALE[scale] || MODELS_BY_SCALE["4x"];
+        const arrayBuffer = await file.arrayBuffer();
+        const imageBlob = new Blob([arrayBuffer], { type: file.type });
+        const imageBuffer = Buffer.from(arrayBuffer);
 
-        let lastError: string | null = null;
+        let lastError = "";
 
-        // Try each model in order
-        for (const modelId of models) {
-            try {
-                console.log(`Trying model: ${modelId}`);
-
-                const result = await hf.imageToImage({
-                    model: modelId,
-                    inputs: imageBlob,
-                });
-
-                // result is a Blob — convert to base64 data URI
-                const arrayBuffer = await result.arrayBuffer();
-                const base64 = Buffer.from(arrayBuffer).toString("base64");
-                const contentType = result.type || "image/png";
-                const dataUri = `data:${contentType};base64,${base64}`;
-
+        // Strategy 1: Try HuggingFace Spaces via Gradio client
+        for (const spaceId of SPACES) {
+            const result = await trySpace(spaceId, imageBlob, scale, token);
+            if (result.success && result.data) {
                 return NextResponse.json({
                     success: true,
-                    output: dataUri,
-                    model: modelId,
-                    scale,
+                    output: result.data,
+                    model: spaceId,
+                    scale: `${scale}x`,
                 });
-            } catch (modelError: unknown) {
-                const errMsg =
-                    modelError instanceof Error
-                        ? modelError.message
-                        : String(modelError);
-                console.log(`Model ${modelId} failed: ${errMsg}`);
-                lastError = errMsg;
-
-                // If model is loading (503), tell the user to retry
-                if (errMsg.includes("loading") || errMsg.includes("503")) {
-                    return NextResponse.json(
-                        {
-                            error:
-                                "The AI model is warming up (cold start). Please wait 30 seconds and try again.",
-                            loading: true,
-                            estimatedTime: 30,
-                        },
-                        { status: 503 }
-                    );
-                }
-
-                // Continue to next model otherwise
-                continue;
             }
+            lastError = result.error || "Unknown error";
         }
 
-        // All models failed
+        // Strategy 2: Try HuggingFace Inference API directly
+        const hfResult = await tryHfInference(imageBuffer, token);
+        if (hfResult.success && hfResult.data) {
+            return NextResponse.json({
+                success: true,
+                output: hfResult.data,
+                model: "HuggingFace Inference API",
+                scale: "2x",
+            });
+        }
+        lastError = hfResult.error || lastError;
+
         return NextResponse.json(
             {
-                error: `All upscaling models are currently unavailable. Last error: ${lastError}. Please try again in a moment.`,
+                error: `All upscaling services are currently unavailable. Error: ${lastError}. Please try again in a moment — Spaces may need to wake up.`,
             },
             { status: 503 }
         );
