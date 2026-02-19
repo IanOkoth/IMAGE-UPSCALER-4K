@@ -1,13 +1,13 @@
 "use client";
 
-import React, { useState, useCallback, useRef } from "react";
-import { Zap, RotateCcw, ArrowUp, Github, Shield } from "lucide-react";
+import React, { useState, useCallback } from "react";
+import { Zap, RotateCcw, ArrowUp, Shield } from "lucide-react";
 import UploadZone from "@/components/UploadZone";
 import ProcessingOverlay from "@/components/ProcessingOverlay";
 import ComparisonSlider from "@/components/ComparisonSlider";
 import DownloadButton from "@/components/DownloadButton";
 
-type AppState = "idle" | "uploading" | "processing" | "complete" | "error";
+type AppState = "idle" | "processing" | "complete" | "error";
 
 interface UpscaleResult {
     originalUrl: string;
@@ -20,125 +20,59 @@ export default function Home() {
     const [error, setError] = useState<string | null>(null);
     const [result, setResult] = useState<UpscaleResult | null>(null);
     const [processingStatus, setProcessingStatus] = useState("uploading");
-    const pollingRef = useRef<NodeJS.Timeout | null>(null);
-    const abortRef = useRef(false);
-
-    const stopPolling = useCallback(() => {
-        if (pollingRef.current) {
-            clearInterval(pollingRef.current);
-            pollingRef.current = null;
-        }
-    }, []);
-
-    const pollPrediction = useCallback(
-        (predictionId: string, originalUrl: string, scale: number) => {
-            setProcessingStatus("starting");
-
-            pollingRef.current = setInterval(async () => {
-                if (abortRef.current) {
-                    stopPolling();
-                    return;
-                }
-
-                try {
-                    const response = await fetch(`/api/upscale/${predictionId}`);
-                    const data = await response.json();
-
-                    if (data.error && !data.status) {
-                        stopPolling();
-                        setError(data.error);
-                        setAppState("error");
-                        return;
-                    }
-
-                    if (data.status === "processing") {
-                        setProcessingStatus("processing");
-                    }
-
-                    if (data.status === "succeeded") {
-                        stopPolling();
-                        setProcessingStatus("succeeded");
-
-                        // The output is the URL of the upscaled image
-                        const outputUrl =
-                            typeof data.output === "string"
-                                ? data.output
-                                : Array.isArray(data.output)
-                                    ? data.output[0]
-                                    : null;
-
-                        if (outputUrl) {
-                            setTimeout(() => {
-                                setResult({
-                                    originalUrl: originalUrl,
-                                    upscaledUrl: outputUrl,
-                                    scale: scale,
-                                });
-                                setAppState("complete");
-                            }, 500);
-                        } else {
-                            setError("No output received from the AI model.");
-                            setAppState("error");
-                        }
-                    }
-
-                    if (data.status === "failed") {
-                        stopPolling();
-                        setError(data.error || "AI processing failed. Please try again.");
-                        setAppState("error");
-                    }
-
-                    if (data.status === "canceled") {
-                        stopPolling();
-                        setAppState("idle");
-                    }
-                } catch (err) {
-                    console.error("Polling error:", err);
-                    // Don't stop polling on network errors — retry
-                }
-            }, 2000);
-        },
-        [stopPolling]
-    );
 
     const handleUpload = useCallback(
         async (file: File, scale: number, faceEnhance: boolean) => {
-            setAppState("uploading");
+            setAppState("processing");
             setProcessingStatus("uploading");
             setError(null);
-            abortRef.current = false;
 
             try {
-                // Convert file to base64
-                const base64 = await new Promise<string>((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onload = () => resolve(reader.result as string);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(file);
-                });
-
                 // Create object URL for original preview
                 const originalUrl = URL.createObjectURL(file);
 
-                // Send to API
+                // Build FormData for the upload
+                const formData = new FormData();
+                formData.append("image", file);
+                formData.append("scale", `${scale}x`);
+
+                setProcessingStatus("processing");
+
+                // Send to API — synchronous call, HuggingFace returns the result directly
                 const response = await fetch("/api/upscale", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        image: base64,
-                        scale,
-                        faceEnhance,
-                    }),
+                    body: formData,
                 });
 
                 const data = await response.json();
 
-                if (!response.ok) {
-                    throw new Error(data.error || "Failed to start upscaling");
+                // Handle model loading (503)
+                if (response.status === 503 && data.loading) {
+                    setError(
+                        `The AI model is warming up. Please wait ~${data.estimatedTime || 30}s and try again.`
+                    );
+                    setAppState("error");
+                    return;
                 }
 
-                setAppState("processing");
-                pollPrediction(data.id, originalUrl, scale);
+                if (!response.ok) {
+                    throw new Error(data.error || "Failed to upscale image");
+                }
+
+                if (data.success && data.output) {
+                    setProcessingStatus("succeeded");
+                    // Short delay for the UI to show "Finalizing..."
+                    await new Promise((r) => setTimeout(r, 500));
+
+                    setResult({
+                        originalUrl,
+                        upscaledUrl: data.output,
+                        scale,
+                    });
+                    setAppState("complete");
+                } else {
+                    throw new Error("No output received from the AI model.");
+                }
             } catch (err) {
                 const message =
                     err instanceof Error ? err.message : "An unexpected error occurred";
@@ -146,22 +80,14 @@ export default function Home() {
                 setAppState("error");
             }
         },
-        [pollPrediction]
+        []
     );
 
-    const handleCancel = useCallback(() => {
-        abortRef.current = true;
-        stopPolling();
-        setAppState("idle");
-        setError(null);
-    }, [stopPolling]);
-
     const handleReset = useCallback(() => {
-        stopPolling();
         setAppState("idle");
         setResult(null);
         setError(null);
-    }, [stopPolling]);
+    }, []);
 
     return (
         <main className="min-h-screen flex flex-col">
@@ -191,7 +117,7 @@ export default function Home() {
                         <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-violet-500/10 border border-violet-500/20 mb-5">
                             <Zap className="w-3.5 h-3.5 text-violet-400" />
                             <span className="text-xs font-medium text-violet-300">
-                                Powered by Real-ESRGAN AI
+                                Powered by Swin2SR Super-Resolution AI
                             </span>
                         </div>
                         <h1 className="text-4xl sm:text-5xl lg:text-6xl font-extrabold text-white mb-4 tracking-tight">
@@ -208,17 +134,16 @@ export default function Home() {
                 )}
 
                 {/* State Rendering */}
-                {(appState === "idle" || appState === "uploading" || appState === "error") && (
+                {(appState === "idle" || appState === "error") && (
                     <UploadZone
                         onUpload={handleUpload}
-                        disabled={appState === "uploading"}
+                        disabled={false}
                     />
                 )}
 
-                {(appState === "uploading" || appState === "processing") && (
+                {appState === "processing" && (
                     <ProcessingOverlay
                         status={processingStatus}
-                        onCancel={handleCancel}
                     />
                 )}
 
@@ -274,7 +199,7 @@ export default function Home() {
             {/* Footer */}
             <footer className="w-full py-5 px-6 text-center">
                 <div className="flex flex-col sm:flex-row items-center justify-center gap-2 text-xs text-zinc-600">
-                    <span>Built with Next.js & Real-ESRGAN</span>
+                    <span>Built with Next.js & Swin2SR AI</span>
                     <span className="hidden sm:inline">•</span>
                     <span>Images are processed securely and never stored</span>
                 </div>
