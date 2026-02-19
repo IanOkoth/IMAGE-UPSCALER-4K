@@ -44,7 +44,20 @@ export default function Home() {
                     body: formData,
                 });
 
-                const data = await response.json();
+                let data;
+                const responseText = await response.text();
+
+                try {
+                    data = JSON.parse(responseText);
+                } catch (e) {
+                    console.error("Failed to parse API response:", responseText);
+                    throw new Error(
+                        `API returned invalid response: ${responseText.slice(
+                            0,
+                            100
+                        )}...`
+                    );
+                }
 
                 // Handle model loading (503)
                 if (response.status === 503 && data.loading) {
@@ -56,7 +69,7 @@ export default function Home() {
                 }
 
                 if (!response.ok) {
-                    throw new Error(data.error || "Failed to upscale image");
+                    throw new Error(data.error || `Server error: ${response.status}`);
                 }
 
                 if (data.success && data.output) {
